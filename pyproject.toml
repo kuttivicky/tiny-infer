@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-infer"
+version = "0.1.0"
+description = "A hand-written Qwen2 inference stack"
+requires-python = ">=3.10"
+
+# Runtime deps are deliberately not pinned here: torch is installed from the
+# CUDA wheel index (2.12.1+cu126) and listing it would let pip swap in the
+# CPU build from PyPI. Use requirements.txt to recreate the environment.
+dependencies = []
+
+[tool.setuptools]
+packages = ["tinyinfer"]

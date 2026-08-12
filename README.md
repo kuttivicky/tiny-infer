@@ -42,7 +42,14 @@ Pinned in [requirements.txt](requirements.txt). Developed against torch
 python -m venv venv
 venv/Scripts/activate       # source venv/bin/activate on POSIX
 pip install -r requirements.txt
+pip install -e . --no-deps  # puts `tinyinfer` on the path from any cwd
 ```
+
+The editable install matters: without it, `python scripts/generate.py` fails
+with `ModuleNotFoundError: No module named 'tinyinfer'`, because Python seeds
+`sys.path[0]` with the *script's* directory (`scripts/`) rather than the repo
+root. `--no-deps` keeps pip from replacing the CUDA torch wheel with the CPU
+build from PyPI.
 
 ## Layout
 
