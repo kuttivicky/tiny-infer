@@ -47,28 +47,32 @@ def build_rope_cache(head_dim, max_pos, theta, device, dtype):
     emb = torch.cat((freqs, freqs), dim=-1)           # (max_pos, head_dim)
     return emb.cos().to(dtype), emb.sin().to(dtype)
     
-class KVCache:
-    """Preallocated contiguous KV cache for a single sequence.
+class PagedKVCache:
+    """Flat block-structured KV pool shared by ALL sequences.
 
-    Shape per layer: (batch, kv_heads, max_seq, head_dim).
-    We allocate the full slab up front rather than growing it, because
-    reallocating + copying every step would defeat the purpose. Note the
-    cost: max_seq slots are reserved even if the sequence stays short.
-    That internal waste is exactly what PagedAttention fixes next.
+    Layout per layer: (num_blocks * block_size, kv_heads, head_dim)
+    We keep the slot dimension flat rather than (num_blocks, block_size, ...)
+    so writes and gathers are a single index_select on dim 0 — no reshape
+    arithmetic in the hot path.
     """
-    def __init__(self, cfg, max_seq, device, dtype, batch_size=1):
-        shape = (cfg.num_hidden_layers, batch_size,
-                 cfg.num_key_value_heads, max_seq, cfg.head_dim)
+    def __init__(self, cfg, num_blocks, block_size, device, dtype):
+        n_slots = num_blocks * block_size
+        shape = (cfg.num_hidden_layers, n_slots, cfg.num_key_value_heads, cfg.head_dim)
         self.k = torch.zeros(shape, device=device, dtype=dtype)
         self.v = torch.zeros(shape, device=device, dtype=dtype)
 
-    def update(self, layer_idx, k, v, start_pos):
-        """Write the new tokens' K/V at [start_pos, start_pos+s), return all valid K/V."""
-        s = k.shape[2]
-        end = start_pos + s
-        self.k[layer_idx, :, :, start_pos:end] = k
-        self.v[layer_idx, :, :, start_pos:end] = v
-        return self.k[layer_idx, :, :, :end], self.v[layer_idx, :, :, :end]
+    def write(self, layer_idx, k, v, slots):
+        # k, v: (1, kv_heads, s, head_dim) -> (s, kv_heads, head_dim)
+        k = k[0].transpose(0, 1)
+        v = v[0].transpose(0, 1)
+        self.k[layer_idx].index_copy_(0, slots, k)   # scatter into arbitrary slots
+        self.v[layer_idx].index_copy_(0, slots, v)
+
+    def gather(self, layer_idx, slots):
+        # returns (1, kv_heads, len(slots), head_dim) in LOGICAL order
+        k = self.k[layer_idx].index_select(0, slots)   # (n, kv_heads, head_dim)
+        v = self.v[layer_idx].index_select(0, slots)
+        return k.transpose(0, 1).unsqueeze(0), v.transpose(0, 1).unsqueeze(0)
 
 
 class Qwen2Attention(nn.Module):
@@ -85,7 +89,7 @@ class Qwen2Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
 
-    def forward(self, x, cos, sin, cache=None, layer_idx=0, start_pos=0):
+    def forward(self, x, cos, sin, paged=None, layer_idx=0, start_pos=0):
         # x: (batch, seq, 896)
         b, s, _ = x.shape
 
@@ -101,8 +105,10 @@ class Qwen2Attention(nn.Module):
         # rotate q and k by position
         q, k = apply_rope(q, k, cos, sin)
 
-        if cache is not None:
-            k, v = cache.update(layer_idx, k, v, start_pos) # KV cache
+        if paged is not None:
+            cache, write_slots, read_slots = paged
+            cache.write(layer_idx, k, v, write_slots)      # scatter new K/V
+            k, v = cache.gather(layer_idx, read_slots)     # gather ALL of this seq's K/V
 
         # GQA: SDPA broadcasts the 2 kv heads across the 14 q heads internally,
         # so we hand it the narrow k/v directly. repeat_interleave used to
@@ -127,9 +133,9 @@ class Qwen2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, x, cos, sin, cache=None, layer_idx=0, start_pos=0):
+    def forward(self, x, cos, sin, paged=None, layer_idx=0, start_pos=0):
         #  pre-norm residual: normalize the INPUT to each sub-block, add the output back
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, layer_idx, start_pos)
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, paged, layer_idx, start_pos)
         x = x + self.mlp(self.post_attention_layernorm(x))
 
         return x
@@ -158,15 +164,17 @@ class Qwen2Model(nn.Module):
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
 
-    def forward(self, input_ids: torch.Tensor, cache=None, start_pos=0,
+    def forward(self, input_ids: torch.Tensor, paged=None, start_pos=0,
                 return_all_logits: bool = False) -> torch.Tensor:
         # input_ids: (batch, seq) of int token ids
+        # paged: None, or (PagedKVCache, write_slots, read_slots) with both slot
+        #        tensors already on-device — built once per step, not per layer.
         b, s = input_ids.shape
         x = self.embed_tokens(input_ids)          # (b, s, 896)
         cos = self.cos_cache[start_pos:start_pos + s] # position aware slice
         sin = self.sin_cache[start_pos:start_pos + s]
         for i, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, cache, i, start_pos)
+            x = layer(x, cos, sin, paged, i, start_pos)
         x = self.norm(x)
 
         # Generation only ever samples from the last position, so projecting all
