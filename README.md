@@ -5,11 +5,32 @@ A hand-written Qwen2 inference stack, built from scratch to match HuggingFace
 
 ## Status
 
-**Milestone 1 — done.** `tinyinfer.model.Qwen2Model` reproduces HF logits for
-Qwen2.5-0.5B-Instruct to within `rtol=1e-4, atol=1e-4` in fp32 on CPU.
+| | milestone | check |
+|---|---|---|
+| M1 | hand-written Qwen2 matches HF logits | `python test_milestone1.py` → `0.0` |
+| M3 | contiguous KV cache, TTFT/ITL metrics | `python scripts/generate.py "..."` |
+| M4 | PagedAttention: block manager + paged pool | `python test_paged.py` |
+| M5 | continuous batching with preemption | `python test_engine.py` |
+
+Every test is differential — each milestone is checked against the previous,
+simpler thing that is already known correct, rather than against a golden
+file. M4 compares paged decode to cacheless recompute; M5 compares batched
+generation to running each request alone.
+
+### Numbers (GTX 1650, 4 GB, fp16)
+
+Single-stream decode is launch-bound rather than bandwidth-bound: 0.99 GB of
+weights at ~128 GB/s implies ~8 ms/token, and we see ~130 ms. That gap is why
+batching scales nearly linearly here — it amortizes a fixed per-step cost.
+
+| 8 requests x 48 tokens | wall | tok/s | TTFT p50 |
+|---|---|---|---|
+| sequential | 49.5 s | 7.8 | 21662 ms |
+| continuous, max_batch=4 | 14.0 s | 27.4 | 3653 ms |
+| continuous, max_batch=8 | **7.1 s** | **53.9 (6.9x)** | **612 ms (35x)** |
 
 ```
-python test_milestone1.py
+python scripts/bench_batching.py
 ```
 
 ## Model
@@ -56,7 +77,10 @@ build from PyPI.
 | path | |
 |---|---|
 | [tinyinfer/config.py](tinyinfer/config.py) | reads HF `config.json` |
-| [tinyinfer/model.py](tinyinfer/model.py) | the Qwen2 forward pass |
+| [tinyinfer/model.py](tinyinfer/model.py) | the Qwen2 forward pass + `PagedKVCache` |
 | [tinyinfer/loader.py](tinyinfer/loader.py) | safetensors → module tree, strips the `model.` prefix |
 | [tinyinfer/sampler.py](tinyinfer/sampler.py) | token sampling |
-| [scripts/generate.py](scripts/generate.py) | generation CLI (empty — milestone 2) |
+| [tinyinfer/block_manager.py](tinyinfer/block_manager.py) | logical position → physical slot, OS-page-table style |
+| [tinyinfer/engine.py](tinyinfer/engine.py) | continuous batching: admit / decode / retire / preempt |
+| [scripts/generate.py](scripts/generate.py) | single-stream generation with TTFT + ITL |
+| [scripts/bench_batching.py](scripts/bench_batching.py) | continuous batching vs sequential |
