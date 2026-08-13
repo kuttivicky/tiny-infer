@@ -68,7 +68,8 @@ class Engine:
 
         self.steps = 0
         self.preemptions = 0
-        self.batch_sizes: list[int] = []
+        self.batch_sizes: list[int] = []    # rows in the decode batch
+        self.useful_sizes: list[int] = []   # rows still producing wanted tokens
 
     # ---------------------------------------------------------------- intake
 
@@ -165,9 +166,14 @@ class Engine:
                             positions=positions, pad_mask=mask)
 
         for i, r in enumerate(self.running):
-            r.output_ids.append(sample(logits[i, -1], temperature=0.0))
+            # Guard on `finished` for the benefit of a static scheduler, which
+            # holds done sequences in the batch until the whole wave completes:
+            # the GPU still computes their row, but the token is discarded.
+            if not r.finished:
+                r.output_ids.append(sample(logits[i, -1], temperature=0.0))
 
         self.batch_sizes.append(len(self.running))
+        self.useful_sizes.append(sum(1 for r in self.running if not r.finished))
 
     # --------------------------------------------------------------- retire
 

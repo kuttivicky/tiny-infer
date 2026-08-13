@@ -11,27 +11,71 @@ A hand-written Qwen2 inference stack, built from scratch to match HuggingFace
 | M3 | contiguous KV cache, TTFT/ITL metrics | `python scripts/generate.py "..."` |
 | M4 | PagedAttention: block manager + paged pool | `python test_paged.py` |
 | M5 | continuous batching with preemption | `python test_engine.py` |
+| M6 | measurement + figures | `python scripts/plot_bench.py` |
 
 Every test is differential — each milestone is checked against the previous,
 simpler thing that is already known correct, rather than against a golden
 file. M4 compares paged decode to cacheless recompute; M5 compares batched
 generation to running each request alone.
 
-### Numbers (GTX 1650, 4 GB, fp16)
+## Results
 
-Single-stream decode is launch-bound rather than bandwidth-bound: 0.99 GB of
-weights at ~128 GB/s implies ~8 ms/token, and we see ~130 ms. That gap is why
-batching scales nearly linearly here — it amortizes a fixed per-step cost.
+All figures: Qwen2.5-0.5B-Instruct, GTX 1650 (4 GB), fp16. Regenerate with
+`python scripts/collect_bench.py && python scripts/plot_bench.py`.
 
-| 8 requests x 48 tokens | wall | tok/s | TTFT p50 |
-|---|---|---|---|
-| sequential | 49.5 s | 7.8 | 21662 ms |
-| continuous, max_batch=4 | 14.0 s | 27.4 | 3653 ms |
-| continuous, max_batch=8 | **7.1 s** | **53.9 (6.9x)** | **612 ms (35x)** |
+### 1. Why a KV cache
 
-```
-python scripts/bench_batching.py
-```
+![cost per token vs context length](docs/01_kv_cache.png)
+
+Cost of producing the *next* token at a given context length. Without a cache
+every step re-attends over the whole context, so it climbs linearly — 2356 ms
+at 1024 tokens against a flat 110 ms.
+
+Measured this way on purpose: below ~128 tokens this GPU is launch-bound and
+the attention term is invisible, so timing a short generation loop produces a
+flat step function that hides the effect entirely.
+
+### 2. Batching trades nothing away
+
+![throughput and TTFT vs batch size](docs/02_batch_sweep.png)
+
+Throughput rises and time-to-first-token falls *together* — 8.6 → 58 tok/s
+while TTFT p50 drops 19.4 s → 0.5 s. Scaling is near-linear because decode
+here is launch-bound, not bandwidth-bound: 0.99 GB of weights at ~128 GB/s
+implies ~8 ms/token and we measure ~110 ms, so the fixed per-step cost is what
+batching amortizes. On a GPU that was already bandwidth-saturated the same
+code would show a smaller multiple.
+
+*(Two panels rather than one twin-axis chart: two y-scales on a single plot
+let the author choose where the curves cross, which invents a relationship the
+data doesn't contain.)*
+
+### 3. Static vs continuous, uneven output lengths
+
+![static vs continuous batching](docs/03_static_vs_continuous.png)
+
+The one that matters. Eight requests asking for 8–96 tokens each. Static
+batching admits a wave and holds every slot until the *longest* member
+finishes, so occupancy decays to 25% — the GPU is computing rows whose output
+is discarded. Continuous batching retires finishers immediately and admits
+from the queue, holding 100%.
+
+**19.9 s → 12.7 s (1.57x)** on identical work. The speedup here is bounded by
+mean occupancy (53% → 100%), which is why this gap widens as output lengths
+get more variable — and real traffic is far more variable than this.
+
+### 4. KV memory: contiguous vs paged
+
+![KV memory, contiguous vs paged](docs/04_kv_memory.png)
+
+A contiguous per-sequence cache reserves `max_seq` slots whatever the sequence
+actually does: 201 MB for 8 sequences that use 5 MB. Paged allocates in
+16-token blocks, so waste is bounded by the block size rather than by the
+worst case — **97% wasted → 13%**.
+
+That 13% is the aggregate over these eight short sequences; internal
+fragmentation is per-sequence at most `block_size - 1` slots, so the figure
+falls as sequences get longer (a single 103-token sequence wastes 8%).
 
 ## Model
 
@@ -84,3 +128,5 @@ build from PyPI.
 | [tinyinfer/engine.py](tinyinfer/engine.py) | continuous batching: admit / decode / retire / preempt |
 | [scripts/generate.py](scripts/generate.py) | single-stream generation with TTFT + ITL |
 | [scripts/bench_batching.py](scripts/bench_batching.py) | continuous batching vs sequential |
+| [scripts/collect_bench.py](scripts/collect_bench.py) | all measurements → `bench_data.json` |
+| [scripts/plot_bench.py](scripts/plot_bench.py) | `bench_data.json` → the four figures |
