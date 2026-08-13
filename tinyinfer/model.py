@@ -47,6 +47,29 @@ def build_rope_cache(head_dim, max_pos, theta, device, dtype):
     emb = torch.cat((freqs, freqs), dim=-1)           # (max_pos, head_dim)
     return emb.cos().to(dtype), emb.sin().to(dtype)
     
+class KVCache:
+    """Preallocated contiguous KV cache for a single sequence.
+
+    Shape per layer: (batch, kv_heads, max_seq, head_dim).
+    We allocate the full slab up front rather than growing it, because
+    reallocating + copying every step would defeat the purpose. Note the
+    cost: max_seq slots are reserved even if the sequence stays short.
+    That internal waste is exactly what PagedAttention fixes next.
+    """
+    def __init__(self, cfg, max_seq, device, dtype, batch_size=1):
+        shape = (cfg.num_hidden_layers, batch_size,
+                 cfg.num_key_value_heads, max_seq, cfg.head_dim)
+        self.k = torch.zeros(shape, device=device, dtype=dtype)
+        self.v = torch.zeros(shape, device=device, dtype=dtype)
+
+    def update(self, layer_idx, k, v, start_pos):
+        """Write the new tokens' K/V at [start_pos, start_pos+s), return all valid K/V."""
+        s = k.shape[2]
+        end = start_pos + s
+        self.k[layer_idx, :, :, start_pos:end] = k
+        self.v[layer_idx, :, :, start_pos:end] = v
+        return self.k[layer_idx, :, :, :end], self.v[layer_idx, :, :, :end]
+
 
 class Qwen2Attention(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -62,7 +85,7 @@ class Qwen2Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None, layer_idx=0, start_pos=0):
         # x: (batch, seq, 896)
         b, s, _ = x.shape
 
@@ -78,17 +101,23 @@ class Qwen2Attention(nn.Module):
         # rotate q and k by position
         q, k = apply_rope(q, k, cos, sin)
 
-        # GQA: expand 2 kv heads to 14 so each group of 7 q-heads sees its kv head
-        k = k.repeat_interleave(self.num_kv_groups, dim=1)  # (b, 14, s, 64)
-        v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        if cache is not None:
+            k, v = cache.update(layer_idx, k, v, start_pos) # KV cache
 
-        # scaled dot-product attention with causal mask
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # GQA: SDPA broadcasts the 2 kv heads across the 14 q heads internally,
+        # so we hand it the narrow k/v directly. repeat_interleave used to
+        # materialize a 7x-larger k/v here — pure memory traffic for no reason.
+        #
+        # CRITICAL: is_causal only when q_len == kv_len (prefill).
+        # In decode, one query legitimately attends to ALL cached keys.
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=(s > 1), enable_gqa=True
+        )
+
 
         # merge heads back: (b, 14, s, 64) -> (b, s, 896)
         out = out.transpose(1, 2).contiguous().view(b, s, -1)
         return self.o_proj(out)
-
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -98,9 +127,9 @@ class Qwen2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None, layer_idx=0, start_pos=0):
         #  pre-norm residual: normalize the INPUT to each sub-block, add the output back
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, layer_idx, start_pos)
         x = x + self.mlp(self.post_attention_layernorm(x))
 
         return x
@@ -129,18 +158,23 @@ class Qwen2Model(nn.Module):
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, cache=None, start_pos=0,
+                return_all_logits: bool = False) -> torch.Tensor:
         # input_ids: (batch, seq) of int token ids
         b, s = input_ids.shape
         x = self.embed_tokens(input_ids)          # (b, s, 896)
-        cos, sin = self.cos_cache[:s], self.sin_cache[:s]
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        cos = self.cos_cache[start_pos:start_pos + s] # position aware slice
+        sin = self.sin_cache[start_pos:start_pos + s]
+        for i, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, cache, i, start_pos)
         x = self.norm(x)
+
+        # Generation only ever samples from the last position, so projecting all
+        # s positions through a 151936-wide lm_head is wasted work — it dominates
+        # prefill for long prompts. Teacher-forced comparisons (the Milestone 1
+        # oracle) need every position, so they pass return_all_logits=True.
+        if not return_all_logits:
+            return self.lm_head(x[:, -1:, :])     # (b, 1, vocab_size)
         return self.lm_head(x)                    # (b, s, vocab_size)
 
-
-
-# def apply_rope(q, k, positions, inv_freq):
-#     return
     

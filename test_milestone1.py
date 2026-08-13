@@ -11,7 +11,8 @@ mine = load_model(MODEL_PATH, device="cpu", dtype=torch.float32)
 ref  = AutoModelForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.float32).eval()
 
 with torch.no_grad():
-    a = mine(ids)
+    # every position, not just the last — this is a teacher-forced comparison
+    a = mine(ids, return_all_logits=True)
     b = ref(ids).logits
 
 print("max abs diff:", (a - b).abs().max().item())
