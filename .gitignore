@@ -17,3 +17,10 @@ dist/
 
 # benchmark dumps from scripts/generate.py
 *.pt
+
+# personal — this repo is public, and the resume carries a phone number
+resume.tex
+resume.pdf
+*.aux
+*.log
+*.out
